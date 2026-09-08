@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WSL2 local backport <local@wsl2.invalid>
+Date: Wed, 15 Jul 2026 14:30:00 +0900
+Subject: [PATCH] migrate: remove ->writepage call from fallback migration
+
+Backport the behavior of upstream commit
+7ee3647243e5c4a9d74d4c7ec621eac75c6d37ea ("migrate: Remove call to
+->writepage") to the Microsoft WSL 6.6 kernel.
+
+Calling a filesystem's ->writepage method while migrating a dirty folio
+can drop the folio lock and start asynchronous writeback.  A later retry
+can then reach migrate_folio_extra() with the source folio still under
+writeback and trigger its BUG_ON(folio_test_writeback(src)).
+
+Do not initiate filesystem writeback from the migration path.  Return
+-EBUSY for dirty folios and let normal writeback clean them before a
+future migration attempt.
+
+This is a semantic backport because the 6.6 tree still has
+MIGRATE_SYNC_NO_COPY and older migrate helper signatures, so the upstream
+patch does not apply verbatim.
+
+Upstream: 7ee3647243e5c4a9d74d4c7ec621eac75c6d37ea
+Link: https://github.com/torvalds/linux/commit/7ee3647243e5c4a9d74d4c7ec621eac75c6d37ea
+---
+ mm/migrate.c | 54 ++----------------------------------------------------
+ 1 file changed, 2 insertions(+), 52 deletions(-)
+
+diff --git a/mm/migrate.c b/mm/migrate.c
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -867,64 +867,14 @@ int filemap_migrate_folio(struct address_space *mapping,
+ }
+ EXPORT_SYMBOL_GPL(filemap_migrate_folio);
+ 
+-/*
+- * Writeback a folio to clean the dirty state
+- */
+-static int writeout(struct address_space *mapping, struct folio *folio)
+-{
+-	struct writeback_control wbc = {
+-		.sync_mode = WB_SYNC_NONE,
+-		.nr_to_write = 1,
+-		.range_start = 0,
+-		.range_end = LLONG_MAX,
+-		.for_reclaim = 1
+-	};
+-	int rc;
+-
+-	if (!mapping->a_ops->writepage)
+-		/* No write method for the address space */
+-		return -EINVAL;
+-
+-	if (!folio_clear_dirty_for_io(folio))
+-		/* Someone else already triggered a write */
+-		return -EAGAIN;
+-
+-	/*
+-	 * A dirty folio may imply that the underlying filesystem has
+-	 * the folio on some queue. So the folio must be clean for
+-	 * migration. Writeout may mean we lose the lock and the
+-	 * folio state is no longer what we checked for earlier.
+-	 * At this point we know that the migration attempt cannot
+-	 * be successful.
+-	 */
+-	remove_migration_ptes(folio, folio, false);
+-
+-	rc = mapping->a_ops->writepage(&folio->page, &wbc);
+-
+-	if (rc != AOP_WRITEPAGE_ACTIVATE)
+-		/* unlocked. Relock */
+-		folio_lock(folio);
+-
+-	return (rc < 0) ? -EIO : -EAGAIN;
+-}
+-
+ /*
+  * Default handling if a filesystem does not provide a migration function.
+  */
+ static int fallback_migrate_folio(struct address_space *mapping,
+ 		struct folio *dst, struct folio *src, enum migrate_mode mode)
+ {
+-	if (folio_test_dirty(src)) {
+-		/* Only writeback folios in full synchronous migration */
+-		switch (mode) {
+-		case MIGRATE_SYNC:
+-		case MIGRATE_SYNC_NO_COPY:
+-			break;
+-		default:
+-			return -EBUSY;
+-		}
+-		return writeout(mapping, src);
+-	}
++	if (folio_test_dirty(src))
++		return -EBUSY;
+ 
+ 	/*
+ 	 * Buffers may be managed in a filesystem specific way.
+-- 
+2.43.0
